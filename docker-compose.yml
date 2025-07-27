@@ -1,0 +1,46 @@
+x-api_template: &api_template
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment:
+    PAYMENT_PROCESSOR_DEFAULT_URL: "http://payment-processor-default:8080"
+    PAYMENT_PROCESSOR_FALLBACK_URL: "http://payment-processor-fallback:8080"
+    PORT: 80
+  networks:
+    - backend
+    - payment-processor
+  deploy:
+    resources:
+      limits:
+        cpus: "0.5"
+        memory: "115MB"
+services:
+  api01:
+    <<: *api_template
+    hostname: api01
+
+  api02:
+    <<: *api_template
+    hostname: api02
+
+  nginx:
+    image: nginx
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "9999:80"
+    depends_on:
+      - api01
+      - api02
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: "70MB"
+
+networks:
+  backend:
+  payment-processor:
+    external: true
