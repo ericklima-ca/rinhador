@@ -1,65 +1,115 @@
 package controllers
 
 import (
-	"fmt"
+	"sync"
+	"time"
 
 	"github.com/ericklima-ca/rinhador/models"
+	"github.com/ericklima-ca/rinhador/services"
 	"github.com/gofiber/fiber/v3"
 )
 
-// ## Payments
+// Service used: Default or Fallback
+type Service string
 
-// > Principal endpoint que recebe requisições de pagamentos a serem processados.
+const (
+	Default  Service = "default"
+	Fallback Service = "fallback"
+)
 
-// ```
-// POST /payments
-// {
-//     "correlationId": "4a7901b8-7d26-4d9d-aa19-4dc1c7cf60b3",
-//     "amount": 19.90
-// }
+// Persistent in-memory DB instance
+var db = (&InMemoryDB{}).New()
 
-// HTTP 2XX
-// Qualquer coisa
-// ```
+type Transaction struct {
+	CorrelationID string    `json:"correlationId"`
+	Amount        float64   `json:"amount"`
+	RequestedAt   time.Time `json:"requestedAt"`
+	Service       Service   `json:"service"`
+}
 
-// ### requisição
+type InMemoryDB struct {
+	Transactions []Transaction
+	mu           sync.Mutex
+}
 
-// - `correlationId` é um campo obrigatório e único do tipo UUID.
-// - `amount` é um campo obrigatório do tipo decimal.
-
-// ### resposta
-
-// - Qualquer resposta na faixa 2XX (200, 201, 202, etc) é válida. O corpo da resposta não será validado – pode ser qualquer coisa ou até vazio.
-
-func Payments(c fiber.Ctx) error {
-	payment := new(models.Payment)
-
-	// Parse the JSON body into the Payment struct
-	if err := c.Bind().Body(payment); err != nil {
-		return err
+func (db *InMemoryDB) New() *InMemoryDB {
+	return &InMemoryDB{
+		Transactions: []Transaction{},
+		mu:           sync.Mutex{},
 	}
+}
 
-	fmt.Printf("Processing payment with CorrelationID: %s and Amount: %.2f\n", payment.CorrelationID, payment.Amount)
+func (db *InMemoryDB) GetSummary(from, to time.Time) models.Summary {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 
-	// Return a success response
-	return c.Status(fiber.StatusOK).JSON(fiber.Map{
-		"message": "Payment processed successfully",
+	var summary models.Summary
+	for _, tx := range db.Transactions {
+		// Filter by date range if provided
+		if !from.IsZero() && tx.RequestedAt.Before(from) {
+			continue
+		}
+		if !to.IsZero() && tx.RequestedAt.After(to) {
+			continue
+		}
+		switch tx.Service {
+		case Default:
+			summary.Default.TotalRequests++
+			summary.Default.TotalAmount += tx.Amount
+		case Fallback:
+			summary.Fallback.TotalRequests++
+			summary.Fallback.TotalAmount += tx.Amount
+		}
+	}
+	return summary
+}
+
+func (db *InMemoryDB) AddTransaction(correlationID string, amount float64, now time.Time, service Service) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.Transactions = append(db.Transactions, Transaction{
+		CorrelationID: correlationID,
+		Amount:        amount,
+		Service:       service,
+		RequestedAt:   now,
 	})
 }
 
-// GET /payments-summary?from=2020-07-10T12:34:56.000Z&to=2020-07-10T12:35:56.000Z
+func Payments(c fiber.Ctx) error {
+	var payment models.Payment
+	now := time.Now().UTC()
 
-// HTTP 200 - Ok
-// {
-//     "default" : {
-//         "totalRequests": 43236,
-//         "totalAmount": 415542345.98
-//     },
-//     "fallback" : {
-//         "totalRequests": 423545,
-//         "totalAmount": 329347.34
-//     }
-// }
+	// Parse the JSON body into the Payment struct
+	if err := c.Bind().JSON(&payment); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid payment payload",
+		})
+	}
+
+	var service Service
+	var err error
+
+	// Try processing with the default service
+	if err = services.ProcessPayment(payment.CorrelationID, payment.Amount); err != nil {
+		// Fallback if default fails
+		if err = services.ProcessPaymentFallback(payment.CorrelationID, payment.Amount); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to process payment",
+			})
+		}
+		service = Fallback
+		db.AddTransaction(payment.CorrelationID, payment.Amount, now, service)
+	} else {
+		service = Default
+		db.AddTransaction(payment.CorrelationID, payment.Amount, now, service)
+	}
+
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"message":       "Payment processed successfully",
+		"correlationId": payment.CorrelationID,
+		"service":       service,
+	})
+}
 
 type PaymentsSummaryParams struct {
 	From string `query:"from"`
@@ -67,31 +117,33 @@ type PaymentsSummaryParams struct {
 }
 
 func PaymentsSummary(c fiber.Ctx) error {
-	params := new(PaymentsSummaryParams)
-
-	if err := c.Bind().Query(params); err != nil {
+	var params PaymentsSummaryParams
+	if err := c.Bind().Query(&params); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Invalid query parameters",
 		})
 	}
-	fmt.Printf("Fetching payment summary from %s to %s\n", params.From, params.To)
 
-	summary := models.Summary{
-		Default: struct {
-			TotalRequests int     `json:"totalRequests" validate:"required"`
-			TotalAmount   float64 `json:"totalAmount" validate:"required"`
-		}{
-			TotalRequests: 43236,
-			TotalAmount:   415542345.98,
-		},
-		Fallback: struct {
-			TotalRequests int     `json:"totalRequests" validate:"required"`
-			TotalAmount   float64 `json:"totalAmount" validate:"required"`
-		}{
-			TotalRequests: 423545,
-			TotalAmount:   329347.34,
-		},
+	parseTime := func(value, field string) (time.Time, error) {
+		if value == "" {
+			return time.Time{}, nil
+		}
+		t, err := time.Parse(time.RFC3339Nano, value)
+		if err != nil {
+			return time.Time{}, fiber.NewError(fiber.StatusBadRequest, "Invalid '"+field+"' date format")
+		}
+		return t, nil
 	}
 
+	from, err := parseTime(params.From, "from")
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	to, err := parseTime(params.To, "to")
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	summary := db.GetSummary(from, to)
 	return c.Status(fiber.StatusOK).JSON(summary)
 }

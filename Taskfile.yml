@@ -1,0 +1,32 @@
+# https://taskfile.dev
+
+version: "3"
+
+vars:
+  GREETING: Hello, World!
+
+tasks:
+  reset-db:
+    cmds:
+      - |
+        curl http://127.0.0.1:8002/admin/purge-payments \
+          --request POST \
+          --header 'X-Rinha-Token: 123'
+        curl http://127.0.0.1:8001/admin/purge-payments \
+          --request POST \
+          --header 'X-Rinha-Token: 123'
+    silent: true
+  test:
+    cmds:
+      - cd ./tests && K6_WEB_DASHBOARD=true k6 run rinha.js
+    silent: true
+  run:
+    cmds:
+      - go run main.go
+    silent: true
+
+  run-test:
+    cmds:
+      - task reset-db
+      - task test
+    silent: true

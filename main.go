@@ -5,7 +5,9 @@ import (
 
 	"github.com/ericklima-ca/rinhador/controllers"
 	"github.com/go-playground/validator/v10"
+	"github.com/goccy/go-json"
 	"github.com/gofiber/fiber/v3"
+	// "github.com/gofiber/fiber/v3/middleware/logger"
 )
 
 type structValidator struct {
@@ -22,12 +24,17 @@ func main() {
 	// Setup your validator in the config
 	app := fiber.New(fiber.Config{
 		StructValidator: &structValidator{validate: validator.New()},
+		JSONEncoder:     json.Marshal,
+		JSONDecoder:     json.Unmarshal,
 	})
 
-	// Define a route for the GET method on the root path '/'
+	// app.Use(logger.New(logger.Config{
+	// 	Format: "[${ip}]:${port} ${latency} ${status} - ${method} ${path}/${queryParams}\n",
+	// }))
+
 	app.Post("/payments", controllers.Payments)
 	app.Get("/payments-summary", controllers.PaymentsSummary)
 
-	// Start the server on port 3000
-	log.Fatal(app.Listen(":3000"))
+	// Start the server on port 9999
+	log.Fatal(app.Listen(":9999"))
 }
